@@ -148,9 +148,7 @@ func SaveAnalyzeResultToStorage(sctx sessionctx.Context,
 	// txn1: lockKeys on point get (index lock)
 	// txn2: lockKeys on batch point get (row lock) — waits for txn1 for index lock
 	// txn1: lockKeys on point get (row lock) — deadlock occurs here and it's not retryable
-	fakeTableID := -1988
-	tableIDStrs := []string{fmt.Sprintf("%d", fakeTableID), fmt.Sprintf("%d", tableID)}
-	rs, err = util.Exec(sctx, "select snapshot, count, modify_count from mysql.stats_meta where table_id in (%?) for update", tableIDStrs)
+	rs, err = util.Exec(sctx, "select snapshot, count, modify_count from mysql.stats_meta where table_id = %? for update", tableID)
 	if err != nil {
 		return 0, err
 	}

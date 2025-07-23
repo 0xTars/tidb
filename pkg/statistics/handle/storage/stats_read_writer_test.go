@@ -17,6 +17,7 @@ package storage_test
 import (
 	"context"
 	"strconv"
+	"sync"
 	"testing"
 
 	"github.com/pingcap/failpoint"
@@ -223,4 +224,81 @@ func TestFailedToHandleSlowStatsSaving(t *testing.T) {
 	`)
 	testKit.MustExec("insert into t values (1,2),(2,2),(6,2),(11,2),(16,2)")
 	testKit.MustGetErrMsg("analyze table t with 0 topn", "failed to update stats meta version during analyze result save. The system may be too busy. Please retry the operation later")
+}
+
+func TestDumpStatsDeltasAndAnalyzeTableConcurrently(t *testing.T) {
+	// Enable the failpoint to introduce latency between locking operations
+	require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/executor/pointGetLockLatency", "return"))
+	defer func() {
+		require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/pkg/executor/pointGetLockLatency"))
+	}()
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	testKit := testkit.NewTestKit(t, store)
+	h := dom.StatsHandle()
+	testKit.MustExec("use test")
+	testKit.MustExec("drop table if exists t")
+	testKit.MustExec("drop table if exists t1")
+	testKit.MustExec("create table t (a int, b int, index idx(a))")
+	testKit.MustExec("create table t1 (a int, b int, index idx(a))")
+	testKit.MustExec("create table t2 (a int, b int, index idx(a))")
+	testKit.MustExec("create table t3 (a int, b int, index idx(a))")
+	testKit.MustExec("insert into t values (1,2),(2,2),(6,2),(11,2),(16,2)")
+	testKit.MustExec("insert into t1 values (1,2),(2,2),(6,2),(11,2),(16,2)")
+	testKit.MustExec("insert into t2 values (1,2),(2,2),(6,2),(11,2),(16,2)")
+	testKit.MustExec("insert into t3 values (1,2),(2,2),(6,2),(11,2),(16,2)")
+	testKit.MustExec("analyze table t all columns")
+	testKit.MustExec("analyze table t1 all columns")
+	testKit.MustExec("analyze table t2 all columns")
+	testKit.MustExec("analyze table t3 all columns")
+
+	// Use a channel to signal when analyze operations are complete
+	analyzeDone := make(chan struct{})
+
+	// Use a counter to track completed analyze operations
+	var analyzeCounter int32
+	var analyzeMutex sync.Mutex
+
+	// Start goroutines to dump stats deltas and analyze table concurrently.
+	wg := sync.WaitGroup{}
+	wg.Add(5) // 1 for stats dumping + 4 for analyze operations
+
+	go func() {
+		defer wg.Done()
+		// Create a separate testKit for this goroutine
+		goroutineTestKit := testkit.NewTestKit(t, store)
+		goroutineTestKit.MustExec("use test")
+		for {
+			select {
+			case <-analyzeDone:
+				// Analyze operations are complete, stop inserting and dumping
+				return
+			default:
+				goroutineTestKit.MustExec("insert into t values (1,2),(2,2),(6,2),(11,2),(16,2)")
+				goroutineTestKit.MustExec("insert into t1 values (1,2),(2,2),(6,2),(11,2),(16,2)")
+				goroutineTestKit.MustExec("insert into t2 values (1,2),(2,2),(6,2),(11,2),(16,2)")
+				goroutineTestKit.MustExec("insert into t3 values (1,2),(2,2),(6,2),(11,2),(16,2)")
+				require.NoError(t, h.DumpStatsDeltaToKV(true))
+			}
+		}
+	}()
+	// Create dedicated goroutines for each table analyze operation
+	for _, tableName := range []string{"t", "t1", "t2", "t3"} {
+		go func(table string) {
+			defer wg.Done()
+			// Create a separate testKit for this goroutine
+			goroutineTestKit := testkit.NewTestKit(t, store)
+			goroutineTestKit.MustExec("use test")
+			for i := 0; i < 50; i++ {
+				goroutineTestKit.MustExec("analyze table " + table + " all columns")
+			}
+			// Increment counter when this table's analyze operations are complete
+			analyzeMutex.Lock()
+			analyzeCounter++
+			if analyzeCounter == 4 { // All 4 tables completed
+				close(analyzeDone)
+			}
+			analyzeMutex.Unlock()
+		}(tableName)
+	}
+	wg.Wait()
 }

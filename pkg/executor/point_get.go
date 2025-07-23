@@ -400,6 +400,13 @@ func (e *PointGetExecutor) Next(ctx context.Context, req *chunk.Chunk) error {
 		}
 	}
 
+	// Introduce latency between the two locking operations
+	failpoint.Inject("pointGetLockLatency", func() {
+		if e.tblInfo.Name.L == "stats_meta" {
+			time.Sleep(100 * time.Millisecond)
+		}
+	})
+
 	key := tablecodec.EncodeRowKeyWithHandle(tblID, e.handle)
 	val, err := e.getAndLock(ctx, key)
 	if err != nil {
