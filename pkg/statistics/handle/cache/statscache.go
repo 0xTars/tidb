@@ -167,6 +167,9 @@ func (s *StatsCacheImpl) Update(ctx context.Context, is infoschema.InfoSchema, t
 	for _, row := range rows {
 		version := row.GetUint64(0)
 		physicalID := row.GetInt64(1)
+		if physicalID == 110 {
+			logutil.BgLogger().Debug("debug for table 110")
+		}
 		modifyCount := row.GetInt64(2)
 		count := row.GetInt64(3)
 		snapshot := row.GetUint64(4)

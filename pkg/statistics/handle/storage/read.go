@@ -515,6 +515,9 @@ func columnStatsFromStorage(sctx sessionctx.Context, row chunk.Row, table *stati
 
 // TableStatsFromStorage loads table stats info from storage.
 func TableStatsFromStorage(sctx sessionctx.Context, snapshot uint64, tableInfo *model.TableInfo, tableID int64, loadAll bool, lease time.Duration, table *statistics.Table) (_ *statistics.Table, err error) {
+	if tableID == 110 {
+		logutil.BgLogger().Debug("debug for issue 110", zap.Stack("stack"))
+	}
 	tracker := memory.NewTracker(memory.LabelForAnalyzeMemory, -1)
 	tracker.AttachTo(sctx.GetSessionVars().MemTracker)
 	defer tracker.Detach()

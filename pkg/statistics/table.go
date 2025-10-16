@@ -25,8 +25,10 @@ import (
 	"github.com/pingcap/tidb/pkg/parser/mysql"
 	"github.com/pingcap/tidb/pkg/planner/planctx"
 	"github.com/pingcap/tidb/pkg/types"
+	"github.com/pingcap/tidb/pkg/util/logutil"
 	"github.com/pingcap/tidb/pkg/util/ranger"
 	"go.uber.org/atomic"
+	"go.uber.org/zap"
 	"golang.org/x/exp/maps"
 )
 
@@ -880,6 +882,9 @@ func (t *Table) ColumnIsLoadNeeded(id int64, fullLoad bool) (*Column, bool, bool
 // Also, if the stats has been loaded into the memory, we also don't need to load it.
 // We return the Index together with the checking result, to avoid accessing the map multiple times.
 func (t *Table) IndexIsLoadNeeded(id int64) (*Index, bool) {
+	if t.PhysicalID == 110 {
+		logutil.BgLogger().Debug("debug for issue 38297", zap.Int64("tableID", t.PhysicalID), zap.Int64("indexID", id))
+	}
 	idx, ok := t.indices[id]
 	// If the index is not in the memory, and we have its stats in the storage. We need to trigger the load.
 	if !ok && (t.ColAndIdxExistenceMap.HasAnalyzed(id, true) || !t.ColAndIdxExistenceMap.Checked()) {
