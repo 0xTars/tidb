@@ -28,6 +28,7 @@ import (
 	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/mysql"
+	"github.com/pingcap/tidb/pkg/planner/core/resolve"
 	"github.com/pingcap/tidb/pkg/sessionctx"
 	"github.com/pingcap/tidb/pkg/statistics"
 	"github.com/pingcap/tidb/pkg/statistics/asyncload"
@@ -194,6 +195,207 @@ func CMSketchAndTopNFromStorageWithHighPriority(sctx sessionctx.Context, tblID i
 		return statistics.DecodeCMSketchAndTopN(nil, topNRows)
 	}
 	return statistics.DecodeCMSketchAndTopN(rows[0].GetBytes(0), topNRows)
+}
+
+// BatchStatsItem represents the result of loading statistics for a single column/index.
+type BatchStatsItem struct {
+	Item     model.TableItemID
+	Hg       *statistics.Histogram
+	Cms      *statistics.CMSketch
+	TopN     *statistics.TopN
+	StatsVer int64
+	Err      error
+}
+
+// BatchLoadStatsForTable loads statistics for multiple columns/indices of a table in a single transaction.
+// This reduces the number of storage round trips by batching multiple stat items together.
+func BatchLoadStatsForTable(
+	sctx sessionctx.Context,
+	tableID int64,
+	items []model.TableItemID,
+	fullLoad bool,
+	colInfoMap map[int64]*model.ColumnInfo, // map of colID -> ColumnInfo
+	isPkIsHandle bool,
+) ([]BatchStatsItem, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+
+	results := make([]BatchStatsItem, len(items))
+
+	// Build the list of hist_ids for the WHERE IN clause
+	histIDs := make([]int64, 0, len(items))
+	itemMap := make(map[int64]int) // histID -> index in results array
+	for i, item := range items {
+		histIDs = append(histIDs, item.ID)
+		itemMap[item.ID] = i
+		results[i].Item = item
+	}
+
+	// Step 1: Load histogram metadata for all items in one query
+	metaQuery := "select HIGH_PRIORITY hist_id, is_index, distinct_count, version, null_count, tot_col_size, stats_ver, correlation, cm_sketch from mysql.stats_histograms where table_id = %? and hist_id in (%?)"
+	metaRows, _, err := util.ExecRows(sctx, metaQuery, tableID, histIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse metadata and prepare for full load if needed
+	type metaInfo struct {
+		histID      int64
+		isIndex     int
+		distinct    int64
+		version     uint64
+		nullCount   int64
+		totColSize  int64
+		statsVer    int64
+		correlation float64
+		cmSketch    []byte
+	}
+	metaMap := make(map[int64]*metaInfo)
+
+	for _, row := range metaRows {
+		histID := row.GetInt64(0)
+		meta := &metaInfo{
+			histID:      histID,
+			isIndex:     int(row.GetInt64(1)),
+			distinct:    row.GetInt64(2),
+			version:     row.GetUint64(3),
+			nullCount:   row.GetInt64(4),
+			totColSize:  row.GetInt64(5),
+			statsVer:    row.GetInt64(6),
+			correlation: row.GetFloat64(7),
+			cmSketch:    row.GetBytes(8),
+		}
+		metaMap[histID] = meta
+	}
+
+	// Step 2: If fullLoad, load buckets for all items in one query
+	var bucketsMap map[int64][]chunk.Row
+	var bucketFields []*resolve.ResultField
+	if fullLoad {
+		bucketsQuery := "select HIGH_PRIORITY hist_id, is_index, bucket_id, count, repeats, lower_bound, upper_bound, ndv from mysql.stats_buckets where table_id = %? and hist_id in (%?) order by hist_id, bucket_id"
+		bucketRows, fields, err := util.ExecRows(sctx, bucketsQuery, tableID, histIDs)
+		if err != nil {
+			return nil, err
+		}
+		bucketFields = fields
+
+		// Group buckets by hist_id
+		bucketsMap = make(map[int64][]chunk.Row)
+		for _, row := range bucketRows {
+			histID := row.GetInt64(0)
+			bucketsMap[histID] = append(bucketsMap[histID], row)
+		}
+	}
+
+	// Step 3: Load TopN for all items in one query
+	topNQuery := "select HIGH_PRIORITY hist_id, is_index, value, count from mysql.stats_top_n where table_id = %? and hist_id in (%?)"
+	topNRows, _, err := util.ExecRows(sctx, topNQuery, tableID, histIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	// Group TopN by hist_id
+	topNMap := make(map[int64][]chunk.Row)
+	for _, row := range topNRows {
+		histID := row.GetInt64(0)
+		// Create a new row with just value and count (skip hist_id and is_index)
+		topNMap[histID] = append(topNMap[histID], row)
+	}
+
+	// Step 4: Build statistics objects for each item
+	for i, item := range items {
+		meta, exists := metaMap[item.ID]
+		if !exists {
+			results[i].Err = errors.Errorf("histogram metadata not found for table_id=%d, hist_id=%d", tableID, item.ID)
+			continue
+		}
+
+		results[i].StatsVer = meta.statsVer
+
+		var tp *types.FieldType
+		if item.IsIndex {
+			tp = types.NewFieldType(mysql.TypeBlob)
+		} else {
+			colInfo := colInfoMap[item.ID]
+			if colInfo == nil {
+				results[i].Err = errors.Errorf("column info not found for column_id=%d", item.ID)
+				continue
+			}
+			tp = &colInfo.FieldType
+		}
+
+		// Create base histogram
+		hg := statistics.NewHistogram(item.ID, meta.distinct, meta.nullCount, meta.version, tp, chunk.InitialCapacity, meta.totColSize)
+		hg.Correlation = meta.correlation
+
+		if fullLoad && len(bucketsMap[item.ID]) > 0 {
+			// Load buckets into histogram
+			buckets := bucketsMap[item.ID]
+			hg = statistics.NewHistogram(item.ID, meta.distinct, meta.nullCount, meta.version, tp, len(buckets), meta.totColSize)
+			hg.Correlation = meta.correlation
+
+			totalCount := int64(0)
+			for _, bucketRow := range buckets {
+				count := bucketRow.GetInt64(3)
+				repeats := bucketRow.GetInt64(4)
+				var lowerBound, upperBound types.Datum
+
+				if item.IsIndex {
+					lowerBound = bucketRow.GetDatum(5, &bucketFields[5].Column.FieldType)
+					upperBound = bucketRow.GetDatum(6, &bucketFields[6].Column.FieldType)
+				} else {
+					d := bucketRow.GetDatum(5, &bucketFields[5].Column.FieldType)
+					if tp.EvalType() == types.ETString && tp.GetType() != mysql.TypeEnum && tp.GetType() != mysql.TypeSet {
+						tp = types.NewFieldType(mysql.TypeBlob)
+					}
+					lowerBound, err = convertBoundFromBlob(statistics.UTCWithAllowInvalidDateCtx, d, tp)
+					if err != nil {
+						results[i].Err = err
+						break
+					}
+					d = bucketRow.GetDatum(6, &bucketFields[6].Column.FieldType)
+					upperBound, err = convertBoundFromBlob(statistics.UTCWithAllowInvalidDateCtx, d, tp)
+					if err != nil {
+						results[i].Err = err
+						break
+					}
+				}
+				totalCount += count
+				hg.AppendBucketWithNDV(&lowerBound, &upperBound, totalCount, repeats, bucketRow.GetInt64(7))
+			}
+			if results[i].Err != nil {
+				continue
+			}
+			hg.PreCalculateScalar()
+		}
+
+		results[i].Hg = hg
+
+		// Decode CMSketch and TopN
+		topNRowsForItem := topNMap[item.ID]
+		// Extract just value and count columns for DecodeTopN
+		simplifiedTopNRows := make([]chunk.Row, 0, len(topNRowsForItem))
+		for _, row := range topNRowsForItem {
+			simplifiedTopNRows = append(simplifiedTopNRows, row)
+		}
+
+		var cms *statistics.CMSketch
+		var topN *statistics.TopN
+		if meta.statsVer > statistics.Version1 {
+			cms, topN, err = statistics.DecodeCMSketchAndTopN(nil, simplifiedTopNRows)
+		} else {
+			cms, topN, err = statistics.DecodeCMSketchAndTopN(meta.cmSketch, simplifiedTopNRows)
+		}
+		if err != nil {
+			results[i].Err = err
+			continue
+		}
+		results[i].Cms = cms
+		results[i].TopN = topN
+	}
+
+	return results, nil
 }
 
 // CMSketchFromStorage reads CMSketch from storage

@@ -52,6 +52,14 @@ import (
 // will only cause congestion and delays
 const RetryCount = 1
 
+// MaxBatchSize is the maximum number of tasks to batch together for loading stats.
+// Batching reduces storage round trips by loading multiple stat items in a single transaction.
+const MaxBatchSize = 20
+
+// BatchCollectionTimeout is the maximum time to wait for collecting tasks into a batch.
+// A small timeout ensures low latency while still allowing batching under high load.
+const BatchCollectionTimeout = 2 * time.Millisecond
+
 // GetSyncLoadConcurrencyByCPU returns the concurrency of sync load by CPU.
 func GetSyncLoadConcurrencyByCPU() int {
 	core := runtime.GOMAXPROCS(0)
@@ -246,40 +254,69 @@ func (s *statsSyncLoad) AppendNeededItem(task *statstypes.NeededItemTask, timeou
 
 var errExit = errors.New("Stop loading since domain is closed")
 
-// SubLoadWorker loads hist data for each column
+// SubLoadWorker loads hist data for each column.
+// It uses batch processing to load multiple stat items in a single transaction for better performance.
 func (s *statsSyncLoad) SubLoadWorker(exit chan struct{}, exitWg *util.WaitGroupEnhancedWrapper) {
 	defer func() {
 		exitWg.Done()
 		statslogutil.StatsLogger().Info("SubLoadWorker: exited.")
 	}()
-	// if the last task is not successfully handled in last round for error or panic, pass it to this round to retry
-	var lastTask *statstypes.NeededItemTask
+
+	// Track failed tasks that need retry
+	var failedTasks []*statstypes.NeededItemTask
+
 	for {
-		task, err := s.HandleOneTask(lastTask, exit)
-		lastTask = task
-		if err != nil {
-			switch err {
-			case errExit:
-				statslogutil.StatsLogger().Info("SubLoadWorker: exits now because the domain is closed.")
-				return
-			default:
-				const msg = "SubLoadWorker: failed to handle one task"
-				if task != nil {
-					statslogutil.StatsErrVerboseSampleLogger().Warn(msg,
-						zap.Error(err),
-						zap.String("task", task.Item.Key()),
-						zap.Int("retry", task.Retry),
-					)
-				} else {
-					statslogutil.StatsErrVerboseSampleLogger().Warn(msg,
-						zap.Error(err),
-					)
+		var tasks []*statstypes.NeededItemTask
+		var err error
+
+		// Process any failed tasks from previous iteration first
+		if len(failedTasks) > 0 {
+			tasks = failedTasks
+			failedTasks = nil
+		} else {
+			// Drain batch of tasks from channels
+			tasks, err = s.drainBatchTasks(exit)
+			if err != nil {
+				if err == errExit {
+					statslogutil.StatsLogger().Info("SubLoadWorker: exits now because the domain is closed.")
+					return
 				}
-				// To avoid the thundering herd effect
-				// thundering herd effect: Everyone tries to retry a large number of requests simultaneously when a problem occurs.
+				statslogutil.StatsErrVerboseSampleLogger().Warn("SubLoadWorker: failed to drain tasks", zap.Error(err))
 				r := rand.Intn(500)
 				time.Sleep(s.statsHandle.Lease()/10 + time.Duration(r)*time.Microsecond)
 				continue
+			}
+		}
+
+		if len(tasks) == 0 {
+			continue
+		}
+
+		// Try batch processing first
+		batchErr := s.HandleBatchTasks(tasks)
+		if batchErr != nil {
+			statslogutil.StatsLogger().Warn("SubLoadWorker: batch processing encountered error",
+				zap.Int("batchSize", len(tasks)),
+				zap.Error(batchErr))
+
+			// Retry failed tasks individually on next iteration
+			for _, task := range tasks {
+				if isVaildForRetry(task) {
+					failedTasks = append(failedTasks, task)
+				} else {
+					// Exceeded retry limit, send error result
+					result := stmtctx.StatsLoadResult{
+						Item:  task.Item.TableItemID,
+						Error: batchErr,
+					}
+					task.ResultCh <- result
+				}
+			}
+
+			if len(failedTasks) > 0 {
+				// To avoid the thundering herd effect
+				r := rand.Intn(500)
+				time.Sleep(s.statsHandle.Lease()/10 + time.Duration(r)*time.Microsecond)
 			}
 		}
 	}
@@ -570,6 +607,299 @@ func (*statsSyncLoad) writeToTimeoutChan(taskCh chan *statstypes.NeededItemTask,
 	case taskCh <- task:
 	default:
 	}
+}
+
+// tableBatch represents a batch of tasks for a single table.
+type tableBatch struct {
+	tableID int64
+	tasks   []*statstypes.NeededItemTask
+}
+
+// drainBatchTasks collects multiple tasks from the channels to enable batch processing.
+// It will collect up to MaxBatchSize tasks or wait up to BatchCollectionTimeout, whichever comes first.
+// Returns a slice of tasks grouped by table ID for efficient batch loading.
+func (s *statsSyncLoad) drainBatchTasks(exit chan struct{}) ([]*statstypes.NeededItemTask, error) {
+	batch := make([]*statstypes.NeededItemTask, 0, MaxBatchSize)
+	timer := time.NewTimer(BatchCollectionTimeout)
+	defer timer.Stop()
+
+	// Try to get the first task (blocking)
+	firstTask, err := s.drainColTask(exit)
+	if err != nil {
+		return nil, err
+	}
+	batch = append(batch, firstTask)
+
+	// Try to collect more tasks without blocking (up to MaxBatchSize)
+	for len(batch) < MaxBatchSize {
+		select {
+		case <-exit:
+			return batch, nil
+		case <-timer.C:
+			// Timeout reached, return current batch
+			return batch, nil
+		case task, ok := <-s.neededItemsCh:
+			if !ok {
+				return batch, nil
+			}
+			// Check if task has already timed out
+			if time.Now().After(task.ToTimeout) {
+				s.writeToTimeoutChan(s.timeoutItemsCh, task)
+				continue
+			}
+			batch = append(batch, task)
+		case task, ok := <-s.timeoutItemsCh:
+			// Only take from timeout channel if needed channel is empty
+			select {
+			case task0, ok0 := <-s.neededItemsCh:
+				if ok0 {
+					if time.Now().After(task0.ToTimeout) {
+						s.writeToTimeoutChan(s.timeoutItemsCh, task0)
+					} else {
+						batch = append(batch, task0)
+					}
+				}
+				if ok {
+					s.writeToTimeoutChan(s.timeoutItemsCh, task)
+				}
+			default:
+				if !ok {
+					return batch, nil
+				}
+				batch = append(batch, task)
+			}
+		default:
+			// No more tasks available without blocking, return current batch
+			return batch, nil
+		}
+	}
+	return batch, nil
+}
+
+// groupTasksByTable groups tasks by table ID for batch processing.
+// Tasks for the same table can be loaded together in a single transaction.
+func groupTasksByTable(tasks []*statstypes.NeededItemTask) []tableBatch {
+	tableMap := make(map[int64][]*statstypes.NeededItemTask)
+	for _, task := range tasks {
+		tableID := task.Item.TableID
+		tableMap[tableID] = append(tableMap[tableID], task)
+	}
+
+	batches := make([]tableBatch, 0, len(tableMap))
+	for tableID, tableTasks := range tableMap {
+		batches = append(batches, tableBatch{
+			tableID: tableID,
+			tasks:   tableTasks,
+		})
+	}
+	return batches
+}
+
+// handleBatchTasksForTable handles a batch of tasks for a single table using batch storage loading.
+func (s *statsSyncLoad) handleBatchTasksForTable(sctx sessionctx.Context, batch tableBatch) error {
+	var skipTypes map[string]struct{}
+	val, err := sctx.GetSessionVars().GlobalVarsAccessor.GetGlobalSysVar(vardef.TiDBAnalyzeSkipColumnTypes)
+	if err != nil {
+		statslogutil.StatsLogger().Warn("failed to get global variable", zap.Error(err))
+	} else {
+		skipTypes = variable.ParseAnalyzeSkipColumnTypes(val)
+	}
+
+	statsTbl, ok := s.statsHandle.Get(batch.tableID)
+	if !ok {
+		// Table doesn't exist or was dropped
+		for _, task := range batch.tasks {
+			task.ResultCh <- stmtctx.StatsLoadResult{Item: task.Item.TableItemID}
+		}
+		return nil
+	}
+
+	is := sctx.GetLatestInfoSchema().(infoschema.InfoSchema)
+	tbl, ok := s.statsHandle.TableInfoByID(is, batch.tableID)
+	if !ok {
+		// Table info not found
+		for _, task := range batch.tasks {
+			task.ResultCh <- stmtctx.StatsLoadResult{Item: task.Item.TableItemID}
+		}
+		return nil
+	}
+	tblInfo := tbl.Meta()
+	isPkIsHandle := tblInfo.PKIsHandle
+
+	// Prepare column info map and items list for batch loading
+	colInfoMap := make(map[int64]*model.ColumnInfo)
+	items := make([]model.TableItemID, 0, len(batch.tasks))
+	taskMap := make(map[model.TableItemID]*statstypes.NeededItemTask)
+
+	for _, task := range batch.tasks {
+		item := task.Item.TableItemID
+
+		// Check if already loaded
+		if item.IsIndex {
+			_, loadNeeded := statsTbl.IndexIsLoadNeeded(item.ID)
+			if !loadNeeded {
+				task.ResultCh <- stmtctx.StatsLoadResult{Item: item}
+				continue
+			}
+		} else {
+			_, loadNeeded, analyzed := statsTbl.ColumnIsLoadNeeded(item.ID, task.Item.FullLoad)
+			if !loadNeeded {
+				task.ResultCh <- stmtctx.StatsLoadResult{Item: item}
+				continue
+			}
+
+			// If not analyzed, create empty column
+			if !analyzed {
+				colInfo := tblInfo.GetColumnByID(item.ID)
+				if colInfo != nil {
+					wrapper := &statsWrapper{col: statistics.EmptyColumn(item.TableID, isPkIsHandle, colInfo)}
+					s.updateCachedItem(item, wrapper.col, nil, task.Item.FullLoad)
+				}
+				task.ResultCh <- stmtctx.StatsLoadResult{Item: item}
+				continue
+			}
+
+			// Get column info
+			colInfo := tblInfo.GetColumnByID(item.ID)
+			if colInfo == nil {
+				task.ResultCh <- stmtctx.StatsLoadResult{Item: item, Error: errors.Errorf("column not found: %d", item.ID)}
+				continue
+			}
+
+			// Check if column should be skipped
+			if skipTypes != nil {
+				_, skip := skipTypes[types.TypeToStr(colInfo.FieldType.GetType(), colInfo.FieldType.GetCharset())]
+				if skip {
+					task.ResultCh <- stmtctx.StatsLoadResult{Item: item}
+					continue
+				}
+			}
+
+			colInfoMap[item.ID] = colInfo
+		}
+
+		// Add to items for batch loading
+		items = append(items, item)
+		taskMap[item] = task
+	}
+
+	// If no items need loading, return
+	if len(items) == 0 {
+		return nil
+	}
+
+	// Batch load stats for all items
+	batchResults, err := storage.BatchLoadStatsForTable(sctx, batch.tableID, items, true, colInfoMap, isPkIsHandle)
+	if err != nil {
+		// On batch error, fall back to individual loading for retry
+		return err
+	}
+
+	// Process results and update cache
+	for _, result := range batchResults {
+		task := taskMap[result.Item]
+		if task == nil {
+			continue
+		}
+
+		loadResult := stmtctx.StatsLoadResult{Item: result.Item}
+
+		if result.Err != nil {
+			loadResult.Error = result.Err
+			task.ResultCh <- loadResult
+			continue
+		}
+
+		// Build the statistics object
+		var wrapper *statsWrapper
+		if result.Item.IsIndex {
+			idxInfo := tblInfo.FindIndexByID(result.Item.ID)
+			if idxInfo == nil {
+				loadResult.Error = errors.Errorf("index info not found for index_id=%d", result.Item.ID)
+				task.ResultCh <- loadResult
+				continue
+			}
+
+			wrapper = &statsWrapper{
+				idxInfo: idxInfo,
+				idx: &statistics.Index{
+					Histogram:         *result.Hg,
+					CMSketch:          result.Cms,
+					TopN:              result.TopN,
+					Info:              idxInfo,
+					StatsVer:          result.StatsVer,
+					PhysicalID:        batch.tableID,
+					StatsLoadedStatus: statistics.NewStatsFullLoadStatus(),
+				},
+			}
+		} else {
+			colInfo := colInfoMap[result.Item.ID]
+			wrapper = &statsWrapper{
+				colInfo: colInfo,
+				col: &statistics.Column{
+					PhysicalID:        batch.tableID,
+					Histogram:         *result.Hg,
+					Info:              colInfo,
+					CMSketch:          result.Cms,
+					TopN:              result.TopN,
+					IsHandle:          isPkIsHandle && mysql.HasPriKeyFlag(colInfo.GetFlag()),
+					StatsVer:          result.StatsVer,
+					StatsLoadedStatus: statistics.NewStatsFullLoadStatus(),
+				},
+			}
+		}
+
+		// Update cache
+		s.updateCachedItem(result.Item, wrapper.col, wrapper.idx, task.Item.FullLoad)
+
+		// Send result
+		task.ResultCh <- loadResult
+	}
+
+	return nil
+}
+
+// HandleBatchTasks handles multiple tasks as a batch, grouped by table for efficiency.
+func (s *statsSyncLoad) HandleBatchTasks(tasks []*statstypes.NeededItemTask) error {
+	if len(tasks) == 0 {
+		return nil
+	}
+
+	// Group tasks by table
+	batches := groupTasksByTable(tasks)
+
+	// Process each table's batch
+	for _, batch := range batches {
+		err := s.statsHandle.SPool().WithSession(func(se *syssession.Session) error {
+			return se.WithSessionContext(func(sctx sessionctx.Context) error {
+				sctx.GetSessionVars().StmtCtx.Priority = mysql.HighPriority
+				defer func() {
+					sctx.GetSessionVars().StmtCtx.Priority = mysql.NoPriority
+				}()
+				return s.handleBatchTasksForTable(sctx, batch)
+			})
+		})
+
+		if err != nil {
+			// On error, fall back to individual processing for this batch
+			statslogutil.StatsLogger().Warn("batch processing failed, falling back to individual processing",
+				zap.Int64("tableID", batch.tableID),
+				zap.Int("batchSize", len(batch.tasks)),
+				zap.Error(err))
+
+			// Process each task individually as fallback
+			for _, task := range batch.tasks {
+				if taskErr := s.handleOneItemTask(task); taskErr != nil {
+					result := stmtctx.StatsLoadResult{Item: task.Item.TableItemID, Error: taskErr}
+					task.ResultCh <- result
+				} else {
+					task.ResultCh <- stmtctx.StatsLoadResult{Item: task.Item.TableItemID}
+				}
+			}
+		}
+	}
+
+	return nil
 }
 
 // updateCachedItem updates the column/index hist to global statsCache.
