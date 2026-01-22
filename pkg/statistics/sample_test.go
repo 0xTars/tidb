@@ -194,7 +194,7 @@ func TestBuildStatsOnRowSample(t *testing.T) {
 }
 
 func TestBuildSampleFullNDV(t *testing.T) {
-	// Testing building TopN when NDV is estimated by FMSketch on sampled rows.
+	// Testing building TopN when NDV is estimated by HyperLogLog on sampled rows.
 	ctx := mock.NewContext()
 	sketch := NewFMSketch(8)
 	data := make([]*SampleItem, 0, 8)
@@ -235,7 +235,7 @@ func TestBuildSampleFullNDV(t *testing.T) {
 		TotalSize: int64(len(data)) * 8,
 	}
 
-	// Verify that FMSketch NDV is different from sample NDV.
+	// Verify that FMSketch NDV is different from sample NDV (FMSketch is ignored for NDV estimation).
 	fmSketchNDV := collector.FMSketch.NDV()
 	require.Greater(t, fmSketchNDV, int64(3), "FMSketch NDV should be greater than sample NDV (3)")
 

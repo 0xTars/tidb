@@ -13,6 +13,7 @@ go_library(
         "constants.go",
         "estimate.go",
         "fmsketch.go",
+        "hll.go",
         "histogram.go",
         "index.go",
         "row_sampler.go",

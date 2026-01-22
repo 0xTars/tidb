@@ -191,9 +191,9 @@ func (b *SortedBuilder) Iterate(data types.Datum) error {
 // collector: the collector of samples.
 // tp: the FieldType for the column.
 // count: represents the row count for the column.
-// ndv: represents the number of distinct values for the column (estimated by FMSketch).
+// ndv: represents the number of distinct values for the column (ignored, estimated by HLL from samples).
 // nullCount: represents the number of null values for the column.
-func BuildColumnHist(ctx sessionctx.Context, numBuckets, id int64, collector *SampleCollector, tp *types.FieldType, count int64, ndv int64, nullCount int64) (*Histogram, error) {
+func BuildColumnHist(ctx sessionctx.Context, numBuckets, id int64, collector *SampleCollector, tp *types.FieldType, count int64, _ int64, nullCount int64) (*Histogram, error) {
 	if count == 0 || len(collector.Samples) == 0 {
 		return NewHistogram(id, 0, nullCount, 0, tp, 0, collector.TotalSize), nil
 	}
@@ -204,9 +204,24 @@ func BuildColumnHist(ctx sessionctx.Context, numBuckets, id int64, collector *Sa
 		return nil, err
 	}
 
+	timeZone := ctx.GetSessionVars().StmtCtx.TimeZone()
+	getComparedBytes := func(datum types.Datum) ([]byte, error) {
+		encoded, err := codec.EncodeKey(timeZone, nil, datum)
+		err = ctx.GetSessionVars().StmtCtx.HandleError(err)
+		return encoded, err
+	}
+	hll := NewHyperLogLog(defaultHLLPrecision)
 	sampleNDV := int64(1)
 	lastValue := &samples[0].Value
-	for i := 1; i < len(samples); i++ {
+	for i := 0; i < len(samples); i++ {
+		sampleBytes, err := getComparedBytes(samples[i].Value)
+		if err != nil {
+			return nil, err
+		}
+		hll.InsertBytes(sampleBytes)
+		if i == 0 {
+			continue
+		}
 		cmp, err := lastValue.Compare(sc.TypeCtx(), &samples[i].Value, collate.GetBinaryCollator())
 		if err != nil {
 			return nil, err
@@ -216,6 +231,7 @@ func BuildColumnHist(ctx sessionctx.Context, numBuckets, id int64, collector *Sa
 			lastValue = &samples[i].Value
 		}
 	}
+	ndv := hll.Estimate()
 	if ndv < sampleNDV {
 		ndv = sampleNDV
 	}
@@ -375,7 +391,7 @@ func calcCorrelation(sampleNum int64, corrXYSum float64) float64 {
 
 // BuildColumn builds histogram from samples for column.
 func BuildColumn(ctx sessionctx.Context, numBuckets, id int64, collector *SampleCollector, tp *types.FieldType) (*Histogram, error) {
-	return BuildColumnHist(ctx, numBuckets, id, collector, tp, collector.Count, collector.FMSketch.NDV(), collector.NullCount)
+	return BuildColumnHist(ctx, numBuckets, id, collector, tp, collector.Count, 0, collector.NullCount)
 }
 
 // BuildHistAndTopN build a histogram and TopN for a column or an index from samples.
@@ -435,10 +451,7 @@ func BuildHistAndTopN(
 		return nil, nil, err
 	}
 
-	ndv := int64(0)
-	if collector.FMSketch != nil {
-		ndv = collector.FMSketch.NDV()
-	}
+	hll := NewHyperLogLog(defaultHLLPrecision)
 
 	sampleNum := int64(len(samples))
 	// As we use samples to build the histogram, the bucket number and repeat should multiply a factor.
@@ -475,6 +488,7 @@ func BuildHistAndTopN(
 		if err != nil {
 			return nil, nil, errors.Trace(err)
 		}
+		hll.InsertBytes(sampleBytes)
 
 		// case 1, this value is equal to the last one: current count++
 		if bytes.Equal(cur, sampleBytes) {
@@ -494,6 +508,7 @@ func BuildHistAndTopN(
 		cur = sampleBytes
 	}
 
+	ndv := hll.Estimate()
 	if ndv < sampleNDV {
 		ndv = sampleNDV
 	}
@@ -514,7 +529,7 @@ func BuildHistAndTopN(
 	// Note: not necessary to add the condition (!allowPruning || (sampleFactor <= 1 || curCnt > 1)), it can be handled
 	// inside processTopNValue but just to make it consistent with previous behavior...
 	if numTopN != 0 && (!allowPruning || (sampleFactor <= 1 || curCnt > 1)) {
-		processTopNValue(boundedMinHeap, cur, curCnt, curStartIdx, sampleNum-1, numTopN, allowPruning, sampleFactor,
+		processTopNValue(boundedMinHeap, cur, float64(curCnt), curStartIdx, sampleNum-1, numTopN, allowPruning, sampleFactor,
 			true)
 	}
 
