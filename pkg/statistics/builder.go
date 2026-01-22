@@ -191,14 +191,11 @@ func (b *SortedBuilder) Iterate(data types.Datum) error {
 // collector: the collector of samples.
 // tp: the FieldType for the column.
 // count: represents the row count for the column.
-// ndv: represents the number of distinct values for the column.
+// ndv: represents the number of distinct values for the column (estimated by FMSketch).
 // nullCount: represents the number of null values for the column.
 func BuildColumnHist(ctx sessionctx.Context, numBuckets, id int64, collector *SampleCollector, tp *types.FieldType, count int64, ndv int64, nullCount int64) (*Histogram, error) {
-	if ndv > count {
-		ndv = count
-	}
 	if count == 0 || len(collector.Samples) == 0 {
-		return NewHistogram(id, ndv, nullCount, 0, tp, 0, collector.TotalSize), nil
+		return NewHistogram(id, 0, nullCount, 0, tp, 0, collector.TotalSize), nil
 	}
 	sc := ctx.GetSessionVars().StmtCtx
 	samples := collector.Samples
@@ -206,6 +203,29 @@ func BuildColumnHist(ctx sessionctx.Context, numBuckets, id int64, collector *Sa
 	if err != nil {
 		return nil, err
 	}
+
+	sampleNDV := int64(1)
+	lastValue := &samples[0].Value
+	for i := 1; i < len(samples); i++ {
+		cmp, err := lastValue.Compare(sc.TypeCtx(), &samples[i].Value, collate.GetBinaryCollator())
+		if err != nil {
+			return nil, err
+		}
+		if cmp != 0 {
+			sampleNDV++
+			lastValue = &samples[i].Value
+		}
+	}
+	if ndv < sampleNDV {
+		ndv = sampleNDV
+	}
+	if ndv > count {
+		ndv = count
+	}
+	if ndv == 0 {
+		return NewHistogram(id, ndv, nullCount, 0, tp, 0, collector.TotalSize), nil
+	}
+
 	hg := NewHistogram(id, ndv, nullCount, 0, tp, int(numBuckets), collector.TotalSize)
 
 	corrXYSum, err := buildHist(sc, hg, samples, count, ndv, numBuckets, nil, int64(len(samples)), nil)
@@ -397,13 +417,9 @@ func BuildHistAndTopN(
 		}
 	}
 	count := collector.Count
-	ndv := collector.FMSketch.NDV()
 	nullCount := collector.NullCount
-	if ndv > count {
-		ndv = count
-	}
-	if count == 0 || len(collector.Samples) == 0 || ndv == 0 {
-		return NewHistogram(id, ndv, nullCount, 0, tp, 0, collector.TotalSize), nil, nil
+	if count == 0 || len(collector.Samples) == 0 {
+		return NewHistogram(id, 0, nullCount, 0, tp, 0, collector.TotalSize), nil, nil
 	}
 	sc := ctx.GetSessionVars().StmtCtx
 	var samples []*SampleItem
@@ -418,7 +434,11 @@ func BuildHistAndTopN(
 	if err != nil {
 		return nil, nil, err
 	}
-	hg := NewHistogram(id, ndv, nullCount, 0, tp, numBuckets, collector.TotalSize)
+
+	ndv := int64(0)
+	if collector.FMSketch != nil {
+		ndv = collector.FMSketch.NDV()
+	}
 
 	sampleNum := int64(len(samples))
 	// As we use samples to build the histogram, the bucket number and repeat should multiply a factor.
@@ -451,9 +471,6 @@ func BuildHistAndTopN(
 		if isColumn {
 			corrXYSum += float64(i) * float64(samples[i].Ordinal)
 		}
-		if numTopN == 0 {
-			continue
-		}
 		sampleBytes, err := getComparedBytes(samples[i].Value)
 		if err != nil {
 			return nil, nil, errors.Trace(err)
@@ -461,18 +478,33 @@ func BuildHistAndTopN(
 
 		// case 1, this value is equal to the last one: current count++
 		if bytes.Equal(cur, sampleBytes) {
-			curCnt++
+			if numTopN != 0 {
+				curCnt++
+			}
 			continue
 		}
 		// case 2, meet a different value: counting for the "current" is complete
 		sampleNDV++
-		// process the completed value using bounded min-heap with range tracking
-		processTopNValue(boundedMinHeap, cur, curCnt, curStartIdx, i-1, numTopN, allowPruning, sampleFactor, false)
-
-		cur, curCnt = sampleBytes, 1
-		curStartIdx = i // new value group starts at current index
+		if numTopN != 0 {
+			// process the completed value using bounded min-heap with range tracking
+			processTopNValue(boundedMinHeap, cur, curCnt, curStartIdx, i-1, numTopN, allowPruning, sampleFactor, false)
+			curCnt = 1
+			curStartIdx = i // new value group starts at current index
+		}
+		cur = sampleBytes
 	}
 
+	if ndv < sampleNDV {
+		ndv = sampleNDV
+	}
+	if ndv > count {
+		ndv = count
+	}
+	if ndv == 0 {
+		return NewHistogram(id, ndv, nullCount, 0, tp, 0, collector.TotalSize), nil, nil
+	}
+
+	hg := NewHistogram(id, ndv, nullCount, 0, tp, numBuckets, collector.TotalSize)
 	// Calc the correlation of the column between the handle column.
 	if isColumn {
 		hg.Correlation = calcCorrelation(sampleNum, corrXYSum)

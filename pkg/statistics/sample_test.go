@@ -194,8 +194,7 @@ func TestBuildStatsOnRowSample(t *testing.T) {
 }
 
 func TestBuildSampleFullNDV(t *testing.T) {
-	// Testing building TopN when the column NDV is larger than the NDV in the sample.
-	// This tests the scenario where ndv > sampleNDV in BuildHistAndTopN.
+	// Testing building TopN when NDV is estimated by FMSketch on sampled rows.
 	ctx := mock.NewContext()
 	sketch := NewFMSketch(8)
 	data := make([]*SampleItem, 0, 8)
@@ -220,14 +219,12 @@ func TestBuildSampleFullNDV(t *testing.T) {
 		data = append(data, &SampleItem{Value: d})
 	}
 
-	// Add many more distinct values to the FMSketch to make column NDV > sample NDV
-	// This simulates a scenario where the full column has many more distinct values
-	// than what's captured in the sample
+	// Add many more distinct values to the FMSketch so its NDV exceeds the sample NDV.
 	for i := 100; i < 200; i++ {
 		d := types.NewIntDatum(int64(i))
 		err := sketch.InsertValue(ctx.GetSessionVars().StmtCtx, d)
 		require.NoError(t, err)
-		// Don't add these to sample data - this creates the discrepancy
+		// Don't add these to sample data
 	}
 
 	collector := &SampleCollector{
@@ -238,9 +235,9 @@ func TestBuildSampleFullNDV(t *testing.T) {
 		TotalSize: int64(len(data)) * 8,
 	}
 
-	// Verify that column NDV > sample NDV
-	columnNDV := collector.FMSketch.NDV()
-	require.Greater(t, columnNDV, int64(3), "Column NDV should be greater than sample NDV (3)")
+	// Verify that FMSketch NDV is different from sample NDV.
+	fmSketchNDV := collector.FMSketch.NDV()
+	require.Greater(t, fmSketchNDV, int64(3), "FMSketch NDV should be greater than sample NDV (3)")
 
 	tp := types.NewFieldType(mysql.TypeLonglong)
 	// Build histogram buckets with 0 buckets, and default 100 TopN.
@@ -249,13 +246,11 @@ func TestBuildSampleFullNDV(t *testing.T) {
 	topNStr, err := topN.DecodedString(ctx, []byte{tp.GetType()})
 	require.NoError(t, err)
 
-	// When ndv > sampleNDV, the TopN list gets trimmed to sampleNDV-1 items
-	// So with sampleNDV=3, we expect 2 items: max(1, 3-1) = 2
-	require.Equal(t, "TopN{length: 2, [(2, 85), (4, 63)]}", topNStr)
+	// All distinct values from samples are included in TopN.
+	require.Equal(t, "TopN{length: 3, [(2, 85), (4, 63), (7, 51)]}", topNStr)
 
-	// Verify that the condition ndv > sampleNDV is properly handled
-	// The TopN should be trimmed to sampleNDV-1 items when ndv > sampleNDV
-	require.Equal(t, 2, len(topN.TopN), "TopN should be trimmed to sampleNDV-1 items when ndv > sampleNDV")
+	// Verify that all distinct values from samples are included
+	require.Equal(t, 3, len(topN.TopN), "TopN should include all distinct values from samples when NDV is calculated from samples")
 }
 
 type testSampleSuite struct {
