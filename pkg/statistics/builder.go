@@ -36,6 +36,8 @@ const (
 	topNPruningThreshold = 10
 	// bucketNDVDivisor is used to calculate bucket count based on remaining NDV
 	bucketNDVDivisor = 2
+	// highCardinalityNDVRatio is the threshold for treating samples as near-unique.
+	highCardinalityNDVRatio = 0.95
 )
 
 func extrapolateNDVFromSamples(sampleNDV, hllNDV, sampleCnt, totalCnt, singletons int64) int64 {
@@ -47,6 +49,12 @@ func extrapolateNDVFromSamples(sampleNDV, hllNDV, sampleCnt, totalCnt, singleton
 		}
 		if coverage > 0 && coverage < 1 {
 			ndv = int64(math.Round(float64(ndv) / coverage))
+		}
+		if float64(sampleNDV) >= float64(sampleCnt)*highCardinalityNDVRatio {
+			scaled := int64(math.Round(float64(sampleNDV) * float64(totalCnt) / float64(sampleCnt)))
+			if scaled > ndv {
+				ndv = scaled
+			}
 		}
 	}
 	if ndv < sampleNDV {
