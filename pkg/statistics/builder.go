@@ -38,6 +38,26 @@ const (
 	bucketNDVDivisor = 2
 )
 
+func extrapolateNDVFromSamples(sampleNDV, hllNDV, sampleCnt, totalCnt, singletons int64) int64 {
+	ndv := hllNDV
+	if sampleCnt > 0 && sampleCnt < totalCnt {
+		coverage := 1.0
+		if singletons > 0 && singletons < sampleCnt {
+			coverage = 1 - float64(singletons)/float64(sampleCnt)
+		}
+		if coverage > 0 && coverage < 1 {
+			ndv = int64(math.Round(float64(ndv) / coverage))
+		}
+	}
+	if ndv < sampleNDV {
+		ndv = sampleNDV
+	}
+	if ndv > totalCnt {
+		ndv = totalCnt
+	}
+	return ndv
+}
+
 // TopNWithRange wraps TopNMeta with index range information for efficient histogram building.
 type TopNWithRange struct {
 	TopNMeta       // embedded TopNMeta
@@ -211,33 +231,37 @@ func BuildColumnHist(ctx sessionctx.Context, numBuckets, id int64, collector *Sa
 		return encoded, err
 	}
 	hll := NewHyperLogLog(defaultHLLPrecision)
+	sampleNum := int64(len(samples))
+	sampleBytes, err := getComparedBytes(samples[0].Value)
+	if err != nil {
+		return nil, err
+	}
+	hll.InsertBytes(sampleBytes)
+	curBytes := sampleBytes
+	curCnt := int64(1)
 	sampleNDV := int64(1)
-	lastValue := &samples[0].Value
-	for i := 0; i < len(samples); i++ {
-		sampleBytes, err := getComparedBytes(samples[i].Value)
+	singletons := int64(0)
+	for i := 1; i < len(samples); i++ {
+		sampleBytes, err = getComparedBytes(samples[i].Value)
 		if err != nil {
 			return nil, err
 		}
 		hll.InsertBytes(sampleBytes)
-		if i == 0 {
+		if bytes.Equal(curBytes, sampleBytes) {
+			curCnt++
 			continue
 		}
-		cmp, err := lastValue.Compare(sc.TypeCtx(), &samples[i].Value, collate.GetBinaryCollator())
-		if err != nil {
-			return nil, err
+		if curCnt == 1 {
+			singletons++
 		}
-		if cmp != 0 {
-			sampleNDV++
-			lastValue = &samples[i].Value
-		}
+		sampleNDV++
+		curBytes = sampleBytes
+		curCnt = 1
 	}
-	ndv := hll.Estimate()
-	if ndv < sampleNDV {
-		ndv = sampleNDV
+	if curCnt == 1 {
+		singletons++
 	}
-	if ndv > count {
-		ndv = count
-	}
+	ndv := extrapolateNDVFromSamples(sampleNDV, hll.Estimate(), sampleNum, count, singletons)
 	if ndv == 0 {
 		return NewHistogram(id, ndv, nullCount, 0, tp, 0, collector.TotalSize), nil
 	}
@@ -471,16 +495,18 @@ func BuildHistAndTopN(
 	if err != nil {
 		return nil, nil, errors.Trace(err)
 	}
-	curCnt := float64(0)
+	hll.InsertBytes(cur)
+	curCnt := int64(1)
 	curStartIdx := int64(0) // track start index of current value group
 	// sampleNDV is the number of distinct values in the samples, which may differ from the real NDV due to sampling.
 	// Initialize to 1 because the first time in the loop we don't increment the sampleNDV - we increment upon change
 	// of value, and the first value is always new.
 	sampleNDV := int64(1)
+	singletons := int64(0)
 	var corrXYSum float64
 
 	// Iterate through the samples
-	for i := range sampleNum {
+	for i := int64(1); i < sampleNum; i++ {
 		if isColumn {
 			corrXYSum += float64(i) * float64(samples[i].Ordinal)
 		}
@@ -492,29 +518,28 @@ func BuildHistAndTopN(
 
 		// case 1, this value is equal to the last one: current count++
 		if bytes.Equal(cur, sampleBytes) {
-			if numTopN != 0 {
-				curCnt++
-			}
+			curCnt++
 			continue
 		}
 		// case 2, meet a different value: counting for the "current" is complete
+		if curCnt == 1 {
+			singletons++
+		}
 		sampleNDV++
 		if numTopN != 0 {
 			// process the completed value using bounded min-heap with range tracking
-			processTopNValue(boundedMinHeap, cur, curCnt, curStartIdx, i-1, numTopN, allowPruning, sampleFactor, false)
-			curCnt = 1
-			curStartIdx = i // new value group starts at current index
+			processTopNValue(boundedMinHeap, cur, float64(curCnt), curStartIdx, i-1, numTopN, allowPruning, sampleFactor, false)
 		}
+		curCnt = 1
+		curStartIdx = i // new value group starts at current index
 		cur = sampleBytes
 	}
 
-	ndv := hll.Estimate()
-	if ndv < sampleNDV {
-		ndv = sampleNDV
+	if curCnt == 1 {
+		singletons++
 	}
-	if ndv > count {
-		ndv = count
-	}
+
+	ndv := extrapolateNDVFromSamples(sampleNDV, hll.Estimate(), sampleNum, count, singletons)
 	if ndv == 0 {
 		return NewHistogram(id, ndv, nullCount, 0, tp, 0, collector.TotalSize), nil, nil
 	}
