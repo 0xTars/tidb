@@ -128,3 +128,19 @@ func SubTestFMSketchCoding() func(*testing.T) {
 		require.Equal(t, fmsketch.NDV(), pkSketch.NDV())
 	}
 }
+
+func TestHLLSketchRankIgnoresBucketBits(t *testing.T) {
+	sketch := NewHLLSketch()
+
+	// The bucket is stored in the low bits. The remaining bits start with a 1,
+	// so the first non-bucket bit should produce rank 1 instead of 1+hllBucketBits.
+	hashVal := (uint64(1) << 63) | 0x7
+	sketch.insertHashValue(hashVal)
+	require.Equal(t, uint8(1), sketch.registers[0x7])
+
+	// After six leading zeros in the non-bucket bits, the rank should be 7.
+	sketch = NewHLLSketch()
+	hashVal = (uint64(1) << (63 - 6)) | 0x3
+	sketch.insertHashValue(hashVal)
+	require.Equal(t, uint8(7), sketch.registers[0x3])
+}

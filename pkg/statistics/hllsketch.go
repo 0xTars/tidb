@@ -61,7 +61,9 @@ func (s *HLLSketch) insertHashValue(hashVal uint64) {
 	if w == 0 {
 		rank = uint8(64 - hllBucketBits + 1)
 	} else {
-		rank = uint8(bits.LeadingZeros64(w) + 1)
+		// `w` is stored in the low 64-hllBucketBits bits after shifting the bucket
+		// bits away, so subtract the bucket width from the full-width leading-zero count.
+		rank = uint8(bits.LeadingZeros64(w) + 1 - hllBucketBits)
 	}
 	if rank > s.registers[bucket] {
 		s.registers[bucket] = rank
