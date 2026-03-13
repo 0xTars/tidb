@@ -16,6 +16,9 @@ package statistics
 
 import (
 	"math"
+
+	"github.com/pingcap/tidb/pkg/util/logutil"
+	"go.uber.org/zap"
 )
 
 // calculateEstimateNDV calculates the estimate ndv of a sampled data from a multisize with size total.
@@ -53,35 +56,73 @@ func calculateEstimateNDV(h *topNHelper, rowCount uint64) (ndv uint64, scaleRati
 //
 // D_hat = d + 1/2 * f1^2 / (d - f1)
 // d: sample NDV; f1: number of values that appear once in the sample.
-func EstimateNDVByChao3(sampleNDV, onlyOnceItems, sampleSize, rowCount uint64) uint64 {
+func EstimateNDVByChao3(sampleNDV, onlyOnceItems, sampleSize, rowCount uint64) (ndv uint64) {
+	originalRowCount := rowCount
+	branch := "formula"
+	denom := 0.0
+	rawEstimate := 0.0
+	roundedNDV := uint64(0)
+	lowerBoundedNDV := uint64(0)
+	rowCountAdjusted := false
+	defer func() {
+		fields := []zap.Field{
+			zap.String("branch", branch),
+			zap.Uint64("sample_ndv", sampleNDV),
+			zap.Uint64("f1", onlyOnceItems),
+			zap.Uint64("sample_size", sampleSize),
+			zap.Uint64("input_row_count", originalRowCount),
+			zap.Uint64("effective_row_count", rowCount),
+			zap.Bool("row_count_adjusted", rowCountAdjusted),
+			zap.Uint64("result_ndv", ndv),
+		}
+		if branch == "non_positive_denom" || branch == "formula" {
+			fields = append(fields, zap.Float64("denom", denom))
+		}
+		if branch == "formula" {
+			fields = append(fields,
+				zap.Float64("raw_estimate", rawEstimate),
+				zap.Uint64("rounded_ndv", roundedNDV),
+				zap.Uint64("lower_bounded_ndv", lowerBoundedNDV),
+			)
+		}
+		logutil.BgLogger().Info("chao3 ndv estimation detail", fields...)
+	}()
+
 	if sampleSize == 0 || sampleNDV == 0 {
+		branch = "empty_input"
 		return 0
 	}
 	if rowCount != 0 && rowCount < sampleNDV {
 		rowCount = sampleNDV
+		rowCountAdjusted = true
 	}
 	if onlyOnceItems == sampleSize {
+		branch = "all_singletons"
 		if rowCount > 0 {
 			return rowCount
 		}
 		return sampleNDV
 	}
 	if onlyOnceItems == 0 {
+		branch = "no_singletons"
 		if rowCount > 0 {
 			return min(sampleNDV, rowCount)
 		}
 		return sampleNDV
 	}
-	denom := float64(sampleNDV - onlyOnceItems)
+	denom = float64(sampleNDV - onlyOnceItems)
 	if denom <= 0 {
+		branch = "non_positive_denom"
 		if rowCount > 0 {
 			return min(sampleNDV, rowCount)
 		}
 		return sampleNDV
 	}
-	est := float64(sampleNDV) + 0.5*float64(onlyOnceItems*onlyOnceItems)/denom
-	ndv := uint64(est + 0.5)
+	rawEstimate = float64(sampleNDV) + 0.5*float64(onlyOnceItems*onlyOnceItems)/denom
+	roundedNDV = uint64(rawEstimate + 0.5)
+	ndv = roundedNDV
 	ndv = max(ndv, sampleNDV)
+	lowerBoundedNDV = ndv
 	if rowCount > 0 {
 		ndv = min(ndv, rowCount)
 	}
