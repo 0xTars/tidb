@@ -17,6 +17,7 @@ package statistics
 import (
 	"math"
 
+	"github.com/pingcap/tidb/pkg/util/intest"
 	"github.com/pingcap/tidb/pkg/util/logutil"
 	"go.uber.org/zap"
 )
@@ -141,21 +142,19 @@ func EstimateNDVByGEE(sampleNDV, onlyOnceItems, sampleSize, rowCount uint64) uin
 	if sampleSize == 0 || sampleNDV == 0 {
 		return 0
 	}
-	if rowCount != 0 && rowCount < sampleNDV {
-		rowCount = sampleNDV
-	}
-	if onlyOnceItems == sampleSize {
-		if rowCount > 0 {
-			return rowCount
-		}
-		return sampleNDV
-	}
-	if onlyOnceItems == 0 {
-		if rowCount > 0 {
-			return min(sampleNDV, rowCount)
-		}
-		return sampleNDV
-	}
+	intest.Assert(rowCount >= sampleNDV, "rowCount should be greater than or equal to sampleNDV")
+	// if onlyOnceItems == sampleSize {
+	// 	if rowCount > 0 {
+	// 		return rowCount
+	// 	}
+	// 	return sampleNDV
+	// }
+	// if onlyOnceItems == 0 {
+	// 	if rowCount > 0 {
+	// 		return min(sampleNDV, rowCount)
+	// 	}
+	// 	return sampleNDV
+	// }
 	f1 := float64(onlyOnceItems)
 	n := float64(sampleSize)
 	rowCountN := float64(rowCount)
