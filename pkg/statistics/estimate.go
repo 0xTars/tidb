@@ -98,7 +98,7 @@ func EstimateNDVByChao3(sampleNDV, onlyOnceItems, sampleSize, rowCount uint64) (
 	}
 	// Treat near-all-singleton samples as effectively unique to tolerate small
 	// sketch errors in f1 estimation.
-	if math.Abs(float64(onlyOnceItems)-float64(sampleSize)) <= float64(sampleSize)*0.01 {
+	if math.Abs(float64(onlyOnceItems)-float64(sampleSize)) <= float64(sampleSize)*0.02 {
 		branch = "all_singletons"
 		if rowCount > 0 {
 			return rowCount
