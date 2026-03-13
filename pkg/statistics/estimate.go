@@ -96,7 +96,9 @@ func EstimateNDVByChao3(sampleNDV, onlyOnceItems, sampleSize, rowCount uint64) (
 		rowCount = sampleNDV
 		rowCountAdjusted = true
 	}
-	if onlyOnceItems == sampleSize {
+	// Treat near-all-singleton samples as effectively unique to tolerate small
+	// sketch errors in f1 estimation.
+	if math.Abs(float64(onlyOnceItems)-float64(sampleSize)) <= float64(sampleSize)*0.01 {
 		branch = "all_singletons"
 		if rowCount > 0 {
 			return rowCount
@@ -110,14 +112,14 @@ func EstimateNDVByChao3(sampleNDV, onlyOnceItems, sampleSize, rowCount uint64) (
 		}
 		return sampleNDV
 	}
-	denom = float64(sampleNDV - onlyOnceItems)
-	if denom <= 0 {
+	if onlyOnceItems >= sampleNDV {
 		branch = "non_positive_denom"
 		if rowCount > 0 {
 			return min(sampleNDV, rowCount)
 		}
 		return sampleNDV
 	}
+	denom = float64(sampleNDV - onlyOnceItems)
 	rawEstimate = float64(sampleNDV) + 0.5*float64(onlyOnceItems*onlyOnceItems)/denom
 	roundedNDV = uint64(rawEstimate + 0.5)
 	ndv = roundedNDV
