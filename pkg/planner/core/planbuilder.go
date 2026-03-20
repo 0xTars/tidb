@@ -64,6 +64,7 @@ import (
 	"github.com/pingcap/tidb/pkg/sessiontxn/staleread"
 	"github.com/pingcap/tidb/pkg/statistics"
 	statslogutil "github.com/pingcap/tidb/pkg/statistics/handle/logutil"
+	statstypes "github.com/pingcap/tidb/pkg/statistics/handle/types"
 	handleutil "github.com/pingcap/tidb/pkg/statistics/handle/util"
 	"github.com/pingcap/tidb/pkg/table"
 	"github.com/pingcap/tidb/pkg/table/tables"
@@ -2163,11 +2164,7 @@ func GetPhysicalIDsAndPartitionNames(tblInfo *model.TableInfo, partitionNames []
 	return ids, names, nil
 }
 
-type tableStatsGetter interface {
-	GetPhysicalTableStats(physicalTableID int64, tblInfo *model.TableInfo) *statistics.Table
-}
-
-func partitionedTableAnalyzeVersionMatches(statsHandle tableStatsGetter, tblInfo *model.TableInfo, requestedVersion int) bool {
+func partitionedTableAnalyzeVersionMatches(statsHandle statstypes.StatsHandle, tblInfo *model.TableInfo, requestedVersion int) bool {
 	globalStats := statsHandle.GetPhysicalTableStats(tblInfo.ID, tblInfo)
 	if _, versionMatches := statistics.ResolveAnalyzeVersionOnTable(globalStats, requestedVersion); !versionMatches {
 		return false
