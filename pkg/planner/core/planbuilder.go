@@ -2163,6 +2163,29 @@ func GetPhysicalIDsAndPartitionNames(tblInfo *model.TableInfo, partitionNames []
 	return ids, names, nil
 }
 
+type tableStatsGetter interface {
+	GetPhysicalTableStats(physicalTableID int64, tblInfo *model.TableInfo) *statistics.Table
+}
+
+func partitionedTableAnalyzeVersionMatches(statsHandle tableStatsGetter, tblInfo *model.TableInfo, requestedVersion int) bool {
+	globalStats := statsHandle.GetPhysicalTableStats(tblInfo.ID, tblInfo)
+	if _, versionMatches := statistics.ResolveAnalyzeVersionOnTable(globalStats, requestedVersion); !versionMatches {
+		return false
+	}
+
+	pi := tblInfo.GetPartitionInfo()
+	if pi == nil {
+		return true
+	}
+	for _, def := range pi.Definitions {
+		partitionStats := statsHandle.GetPhysicalTableStats(def.ID, tblInfo)
+		if _, versionMatches := statistics.ResolveAnalyzeVersionOnTable(partitionStats, requestedVersion); !versionMatches {
+			return false
+		}
+	}
+	return true
+}
+
 type calcOnceMap struct {
 	data       map[int64]struct{}
 	calculated bool
@@ -2639,8 +2662,25 @@ func (b *PlanBuilder) buildAnalyzeFullSamplingTask(
 
 	var predicateCols, mustAnalyzedCols calcOnceMap
 	statsHandle := domain.GetDomain(b.ctx).StatsHandle()
+	dynamicPrune := variable.PartitionPruneMode(b.ctx.GetSessionVars().PartitionPruneMode.Load()) == variable.Dynamic
+	versionMatches := true
+	if !isAnalyzeTable && dynamicPrune && tbl.TableInfo.GetPartitionInfo() != nil {
+		// In dynamic mode, the later global-stats merge consumes all partitions. Reanalyze every partition
+		// when any existing partition/global stats still carry another analyze version.
+		versionMatches = partitionedTableAnalyzeVersionMatches(statsHandle, tbl.TableInfo, version)
+		if !versionMatches {
+			physicalIDs, partitionNames, err = GetPhysicalIDsAndPartitionNames(tbl.TableInfo, nil)
+			if err != nil {
+				return err
+			}
+			b.ctx.GetSessionVars().StmtCtx.AppendWarning(errors.NewNoStackError(
+				"The analyze version from the session is not compatible with the existing statistics of the table. TiDB will analyze all partitions to rewrite the table statistics with the session-selected version",
+			))
+		}
+	} else {
+		_, versionMatches = statsHandle.ResolveAnalyzeVersion(tbl.TableInfo, physicalIDs, version)
+	}
 	// If the statistics of the table is version 1, we must analyze all columns to overwrites all of old statistics.
-	_, versionMatches := statsHandle.ResolveAnalyzeVersion(tbl.TableInfo, physicalIDs, version)
 	mustAllColumns := !versionMatches
 
 	astColsInfo, _, err := b.getFullAnalyzeColumnsInfo(tbl, as.ColumnChoice, astColList, &predicateCols, &mustAnalyzedCols, mustAllColumns, true)
