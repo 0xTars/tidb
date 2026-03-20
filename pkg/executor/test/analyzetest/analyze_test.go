@@ -1347,6 +1347,9 @@ PARTITION BY RANGE ( a ) (
 	require.Equal(t, statistics.Version1, h.GetPhysicalTableStats(pi.Definitions[1].ID, tableInfo).StatsVer)
 
 	tk.MustExec("analyze table t partition p0")
+	tk.MustQuery("show warnings").CheckContain(
+		"The analyze version from the session is not compatible with the existing statistics of the table. TiDB will analyze all partitions to rewrite the table statistics with the session-selected version",
+	)
 	tk.MustQuery(fmt.Sprintf(
 		"select table_id, stats_ver from mysql.stats_histograms where table_id in (%d,%d,%d) group by table_id, stats_ver order by table_id",
 		legacyTableIDs[0], legacyTableIDs[1], legacyTableIDs[2],
