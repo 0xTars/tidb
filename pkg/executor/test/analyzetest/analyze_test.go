@@ -1334,7 +1334,7 @@ PARTITION BY RANGE ( a ) (
 	require.Greater(t, tbl.Version, lastVersion) // global stats updated
 
 	tk.MustExec("analyze table t")
-	// HACK:Downgrade the persisted stats version to simulate legacy v1 stats left on the table.
+	// HACK: Downgrade the persisted stats version to simulate legacy v1 stats left on the table.
 	legacyTableIDs := []int64{tableInfo.ID, pi.Definitions[0].ID, pi.Definitions[1].ID}
 	tk.MustExec(fmt.Sprintf(
 		"update mysql.stats_histograms set stats_ver = 1 where table_id in (%d,%d,%d)",
