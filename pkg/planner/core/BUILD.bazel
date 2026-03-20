@@ -146,7 +146,6 @@ go_library(
         "//pkg/sessiontxn/staleread",
         "//pkg/statistics",
         "//pkg/statistics/handle/logutil",
-        "//pkg/statistics/handle/types",
         "//pkg/statistics/handle/util",
         "//pkg/table",
         "//pkg/table/tables",
