@@ -2639,8 +2639,10 @@ func (b *PlanBuilder) buildAnalyzeFullSamplingTask(
 
 	var predicateCols, mustAnalyzedCols calcOnceMap
 	statsHandle := domain.GetDomain(b.ctx).StatsHandle()
+	dynamicPrune := variable.PartitionPruneMode(b.ctx.GetSessionVars().PartitionPruneMode.Load()) == variable.Dynamic
+	isPartitioned := tbl.TableInfo.GetPartitionInfo() != nil
 	_, versionMatches := statsHandle.ResolveAnalyzeVersion(tbl.TableInfo, version)
-	if !versionMatches && !isAnalyzeTable && variable.PartitionPruneMode(b.ctx.GetSessionVars().PartitionPruneMode.Load()) == variable.Dynamic && tbl.TableInfo.GetPartitionInfo() != nil {
+	if !versionMatches && !isAnalyzeTable && dynamicPrune && isPartitioned {
 		// In dynamic mode, the later global-stats merge consumes all partitions. Reanalyze every partition
 		// when any existing partition/global stats still carry another analyze version.
 		physicalIDs, partitionNames, err = GetPhysicalIDsAndPartitionNames(tbl.TableInfo, nil)
