@@ -114,10 +114,10 @@ partition by range (a) (
 	pi := partitionedTbl.Meta().GetPartitionInfo()
 	require.NotNil(t, pi)
 	legacyTableIDs := []int64{partitionedTbl.Meta().ID, pi.Definitions[0].ID, pi.Definitions[1].ID}
-	tk.MustExec(fmt.Sprintf(
-		"update mysql.stats_histograms set stats_ver = 1 where table_id in (%d,%d,%d)",
+	tk.MustExec(
+		"update mysql.stats_histograms set stats_ver = 1 where table_id in (?,?,?)",
 		legacyTableIDs[0], legacyTableIDs[1], legacyTableIDs[2],
-	))
+	)
 	handle.Clear()
 	require.NoError(t, handle.Update(context.Background(), dom.InfoSchema(), legacyTableIDs...))
 	require.Equal(t, statistics.Version1, handle.GetPhysicalTableStats(partitionedTbl.Meta().ID, partitionedTbl.Meta()).StatsVer)
@@ -141,10 +141,10 @@ partition by range (a) (
 	warnLogs = recorded.FilterMessage("auto analyze rewrites legacy statistics version 1 to version 2").All()
 	require.Len(t, warnLogs, 2)
 	require.Equal(t, "analyze table `pt` partition `p0`", warnLogs[1].ContextMap()["sql"])
-	tk.MustQuery(fmt.Sprintf(
-		"select table_id, stats_ver from mysql.stats_histograms where table_id in (%d,%d,%d) group by table_id, stats_ver order by table_id",
+	tk.MustQuery(
+		"select table_id, stats_ver from mysql.stats_histograms where table_id in (?,?,?) group by table_id, stats_ver order by table_id",
 		legacyTableIDs[0], legacyTableIDs[1], legacyTableIDs[2],
-	)).Check(testkit.Rows(
+	).Check(testkit.Rows(
 		fmt.Sprintf("%d 2", legacyTableIDs[0]),
 		fmt.Sprintf("%d 2", legacyTableIDs[1]),
 		fmt.Sprintf("%d 2", legacyTableIDs[2]),

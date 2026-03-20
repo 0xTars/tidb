@@ -1336,10 +1336,10 @@ PARTITION BY RANGE ( a ) (
 	tk.MustExec("analyze table t")
 	// HACK: Downgrade the persisted stats version to simulate legacy v1 stats left on the table.
 	legacyTableIDs := []int64{tableInfo.ID, pi.Definitions[0].ID, pi.Definitions[1].ID}
-	tk.MustExec(fmt.Sprintf(
-		"update mysql.stats_histograms set stats_ver = 1 where table_id in (%d,%d,%d)",
+	tk.MustExec(
+		"update mysql.stats_histograms set stats_ver = 1 where table_id in (?,?,?)",
 		legacyTableIDs[0], legacyTableIDs[1], legacyTableIDs[2],
-	))
+	)
 	h.Clear()
 	require.NoError(t, h.Update(context.Background(), dom.InfoSchema(), legacyTableIDs...))
 	require.Equal(t, statistics.Version1, h.GetPhysicalTableStats(tableInfo.ID, tableInfo).StatsVer)
@@ -1350,10 +1350,10 @@ PARTITION BY RANGE ( a ) (
 	tk.MustQuery("show warnings").CheckContain(
 		"The analyze version from the session is not compatible with the existing statistics of the table. TiDB will analyze all partitions to rewrite the table statistics with the session-selected version",
 	)
-	tk.MustQuery(fmt.Sprintf(
-		"select table_id, stats_ver from mysql.stats_histograms where table_id in (%d,%d,%d) group by table_id, stats_ver order by table_id",
+	tk.MustQuery(
+		"select table_id, stats_ver from mysql.stats_histograms where table_id in (?,?,?) group by table_id, stats_ver order by table_id",
 		legacyTableIDs[0], legacyTableIDs[1], legacyTableIDs[2],
-	)).Check(testkit.Rows(
+	).Check(testkit.Rows(
 		fmt.Sprintf("%d 2", legacyTableIDs[0]),
 		fmt.Sprintf("%d 2", legacyTableIDs[1]),
 		fmt.Sprintf("%d 2", legacyTableIDs[2]),
