@@ -20,12 +20,14 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/tidb/pkg/config/kerneltype"
+	"github.com/pingcap/tidb/pkg/ddl"
 	"github.com/pingcap/tidb/pkg/domain"
 	"github.com/pingcap/tidb/pkg/domain/infosync"
 	"github.com/pingcap/tidb/pkg/errno"
@@ -638,6 +640,40 @@ func TestAnalyzeSamplingWorkPanic(t *testing.T) {
 	err = tk.ExecToErr("analyze table t")
 	require.NotNil(t, err)
 	require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/pkg/executor/mockAnalyzeSamplingMergeWorkerPanic"))
+}
+
+func TestAnalyzeSamplingUsesSampledRanges(t *testing.T) {
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	atomic.StoreUint32(&ddl.EnableSplitTableRegion, 1)
+	defer atomic.StoreUint32(&ddl.EnableSplitTableRegion, 0)
+
+	tk := testkit.NewTestKit(t, store)
+	tk.MustExec("use test")
+	tk.MustExec("set @@session.tidb_scatter_region='table'")
+	tk.MustExec("set @@session.tidb_analyze_version = 2")
+	tk.MustExec("create table t(a int, b int) shard_row_id_bits = 2 pre_split_regions = 2")
+	for i := 0; i < 100; i++ {
+		tk.MustExec(fmt.Sprintf("insert into t values(%d, %d)", i, i))
+	}
+	tk.MustExec("flush stats_delta")
+	regionRows := tk.MustQuery("select count(*) from t tablesample regions()").Rows()
+	regionCount, err := strconv.Atoi(regionRows[0][0].(string))
+	require.NoError(t, err)
+	require.Equal(t, 4, regionCount)
+
+	tk.MustExec("analyze table t with 0.5 samplerate")
+
+	rows := tk.MustQuery("select processed_rows from mysql.analyze_jobs order by id desc limit 1").Rows()
+	processedRows, err := strconv.Atoi(rows[0][0].(string))
+	require.NoError(t, err)
+	require.Greater(t, processedRows, 0)
+	require.Less(t, processedRows, 100)
+
+	tbl, err := dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("t"))
+	require.NoError(t, err)
+	tk.MustQuery(fmt.Sprintf("select count, modify_count from mysql.stats_meta where table_id = %d", tbl.Meta().ID)).Check(testkit.Rows(
+		"100 0",
+	))
 }
 
 func TestSmallTableAnalyzeV2(t *testing.T) {

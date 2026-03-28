@@ -17,6 +17,7 @@ package executor
 import (
 	"context"
 	stderrors "errors"
+	"math"
 	"slices"
 	"time"
 
@@ -215,8 +216,23 @@ func (e *AnalyzeColumnsExecV2) buildSamplingStats(
 	err error,
 ) {
 	// Open memory tracker and resultHandler.
-	if err = e.open(ranges); err != nil {
+	rangeSamplingPlan, err := e.buildRangeSamplingPlan()
+	if err != nil {
 		return 0, nil, nil, nil, nil, err
+	}
+	effectiveSampleSize := int(e.analyzePB.ColReq.SampleSize)
+	effectiveSampleRate := e.analyzePB.ColReq.GetSampleRate()
+	if rangeSamplingPlan != nil {
+		rangeSamplingAnalyzeReq := e.buildRangeSamplingAnalyzeReq(rangeSamplingPlan)
+		effectiveSampleSize = int(rangeSamplingAnalyzeReq.ColReq.SampleSize)
+		effectiveSampleRate = rangeSamplingAnalyzeReq.ColReq.GetSampleRate()
+		if err = e.openWithKVRanges(rangeSamplingPlan.kvRanges, rangeSamplingAnalyzeReq); err != nil {
+			return 0, nil, nil, nil, nil, err
+		}
+	} else {
+		if err = e.open(ranges); err != nil {
+			return 0, nil, nil, nil, nil, err
+		}
 	}
 	defer func() {
 		if err1 := e.resultHandler.Close(); err1 != nil {
@@ -226,7 +242,7 @@ func (e *AnalyzeColumnsExecV2) buildSamplingStats(
 
 	l := len(e.analyzePB.ColReq.ColumnsInfo) + len(e.analyzePB.ColReq.ColumnGroups)
 	colGroups := buildColumnGroupOffsets(e.analyzePB.ColReq.ColumnGroups)
-	rootRowCollector := statistics.NewRowSampleCollector(int(e.analyzePB.ColReq.SampleSize), e.analyzePB.ColReq.GetSampleRate(), l)
+	rootRowCollector := statistics.NewRowSampleCollector(effectiveSampleSize, effectiveSampleRate, l)
 	for range l {
 		rootRowCollector.Base().FMSketches = append(rootRowCollector.Base().FMSketches, statistics.NewFMSketch(statistics.MaxSketchSize))
 	}
@@ -259,7 +275,7 @@ func (e *AnalyzeColumnsExecV2) buildSamplingStats(
 	for i := range samplingStatsConcurrency {
 		id := i
 		gp.Go(func() {
-			e.subMergeWorker(mergeResultCh, mergeTaskCh, l, id, colGroups)
+			e.subMergeWorker(mergeResultCh, mergeTaskCh, l, id, colGroups, effectiveSampleSize, effectiveSampleRate)
 		})
 	}
 	// Merge the result from collectors.
@@ -323,6 +339,9 @@ func (e *AnalyzeColumnsExecV2) buildSamplingStats(
 		ret := indexPushedDownResult.results[e.indexes[offset].ID]
 		rootRowCollector.Base().NullCount[colLen+offset] = ret.Count
 		rootRowCollector.Base().FMSketches[colLen+offset] = ret.Ars[0].Fms[0]
+	}
+	if rangeSamplingPlan != nil {
+		scaleRangeSampledCollector(rootRowCollector, rangeSamplingPlan.fullCount)
 	}
 	isSpecialIndex := make([]bool, len(e.indexes))
 	for _, offset := range indexesWithVirtualColOffsets {
@@ -450,6 +469,37 @@ func (e *AnalyzeColumnsExecV2) buildSamplingStats(
 	}
 
 	return
+}
+
+func scaleRangeSampledCollector(collector statistics.RowSampleCollector, fullCount int64) {
+	if collector == nil || fullCount <= 0 {
+		return
+	}
+	base := collector.Base()
+	sampledCount := base.Count
+	if sampledCount <= 0 || fullCount <= sampledCount {
+		return
+	}
+
+	scale := float64(fullCount) / float64(sampledCount)
+	for i, nullCount := range base.NullCount {
+		if nullCount <= 0 {
+			continue
+		}
+		scaled := int64(math.Round(float64(nullCount) * scale))
+		base.NullCount[i] = min(scaled, fullCount)
+	}
+	for i, totalSize := range base.TotalSizes {
+		if totalSize <= 0 {
+			continue
+		}
+		scaled := int64(math.Round(float64(totalSize) * scale))
+		if scaled < 0 {
+			scaled = math.MaxInt64
+		}
+		base.TotalSizes[i] = scaled
+	}
+	base.Count = fullCount
 }
 
 // handleNDVForSpecialIndexes deals with the logic to analyze the index containing the virtual column when the mode is full sampling.
@@ -607,7 +657,7 @@ func (e *AnalyzeColumnsExecV2) buildSubIndexJobForSpecialIndex(indexInfos []*mod
 	return tasks
 }
 
-func (e *AnalyzeColumnsExecV2) subMergeWorker(resultCh chan<- *samplingMergeResult, taskCh <-chan []byte, l int, index int, colGroups [][]int64) {
+func (e *AnalyzeColumnsExecV2) subMergeWorker(resultCh chan<- *samplingMergeResult, taskCh <-chan []byte, l int, index int, colGroups [][]int64, sampleSize int, sampleRate float64) {
 	// Only close the resultCh in the first worker.
 	closeTheResultCh := index == 0
 	defer func() {
@@ -639,7 +689,7 @@ func (e *AnalyzeColumnsExecV2) subMergeWorker(resultCh chan<- *samplingMergeResu
 			time.Sleep(100 * time.Millisecond)
 		}
 	})
-	retCollector := statistics.NewRowSampleCollector(int(e.analyzePB.ColReq.SampleSize), e.analyzePB.ColReq.GetSampleRate(), l)
+	retCollector := statistics.NewRowSampleCollector(sampleSize, sampleRate, l)
 	for range l {
 		retCollector.Base().FMSketches = append(retCollector.Base().FMSketches, statistics.NewFMSketch(statistics.MaxSketchSize))
 	}
@@ -663,7 +713,7 @@ func (e *AnalyzeColumnsExecV2) subMergeWorker(resultCh chan<- *samplingMergeResu
 		e.memTracker.Consume(colRespSize)
 
 		// Update processed rows.
-		subCollector := statistics.NewRowSampleCollector(int(e.analyzePB.ColReq.SampleSize), e.analyzePB.ColReq.GetSampleRate(), l)
+		subCollector := statistics.NewRowSampleCollector(sampleSize, sampleRate, l)
 		subCollector.Base().FromProto(colResp.RowCollector, e.memTracker)
 		statsHandle.UpdateAnalyzeJobProgress(e.job, subCollector.Base().Count)
 

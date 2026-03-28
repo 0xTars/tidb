@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"math/rand"
 	"strings"
 	"time"
 
@@ -62,6 +63,11 @@ type AnalyzeColumnsExec struct {
 	baseModifyCnt           int64
 
 	memTracker *memory.Tracker
+}
+
+type analyzeRangeSamplingPlan struct {
+	kvRanges  []kv.KeyRange
+	fullCount int64
 }
 
 func analyzeColumnsPushDownEntry(gp *gp.Pool, e *AnalyzeColumnsExec) *statistics.AnalyzeResults {
@@ -109,7 +115,29 @@ func (e *AnalyzeColumnsExec) open(ranges []*ranger.Range) error {
 func (e *AnalyzeColumnsExec) buildResp(ranges []*ranger.Range) (distsql.SelectResult, error) {
 	var builder distsql.RequestBuilder
 	reqBuilder := builder.SetHandleRangesForTables(e.ctx.GetDistSQLCtx(), []int64{e.TableID.GetStatisticsID()}, e.handleCols != nil && !e.handleCols.IsInt(), ranges)
-	builder.SetResourceGroupTagger(e.ctx.GetSessionVars().StmtCtx.GetResourceGroupTagger())
+	return e.buildAnalyzeResp(reqBuilder, e.analyzePB)
+}
+
+func (e *AnalyzeColumnsExec) openWithKVRanges(kvRanges []kv.KeyRange, analyzePB *tipb.AnalyzeReq) error {
+	e.memTracker = memory.NewTracker(int(e.ctx.GetSessionVars().PlanID.Load()), -1)
+	e.memTracker.AttachTo(e.ctx.GetSessionVars().StmtCtx.MemTracker)
+	e.resultHandler = &tableResultHandler{}
+	result, err := e.buildRespFromKVRanges(kvRanges, analyzePB)
+	if err != nil {
+		return err
+	}
+	e.resultHandler.open(nil, result)
+	return nil
+}
+
+func (e *AnalyzeColumnsExec) buildRespFromKVRanges(kvRanges []kv.KeyRange, analyzePB *tipb.AnalyzeReq) (distsql.SelectResult, error) {
+	var builder distsql.RequestBuilder
+	reqBuilder := builder.SetKeyRanges(kvRanges)
+	return e.buildAnalyzeResp(reqBuilder, analyzePB)
+}
+
+func (e *AnalyzeColumnsExec) buildAnalyzeResp(reqBuilder *distsql.RequestBuilder, analyzePB *tipb.AnalyzeReq) (distsql.SelectResult, error) {
+	reqBuilder.SetResourceGroupTagger(e.ctx.GetSessionVars().StmtCtx.GetResourceGroupTagger())
 	startTS := uint64(math.MaxUint64)
 	isoLevel := kv.RC
 	if e.ctx.GetSessionVars().EnableAnalyzeSnapshot {
@@ -119,7 +147,7 @@ func (e *AnalyzeColumnsExec) buildResp(ranges []*ranger.Range) (distsql.SelectRe
 	// Always set KeepOrder of the request to be true, in order to compute
 	// correct `correlation` of columns.
 	kvReq, err := reqBuilder.
-		SetAnalyzeRequest(e.analyzePB, isoLevel).
+		SetAnalyzeRequest(analyzePB, isoLevel).
 		SetStartTS(startTS).
 		SetKeepOrder(true).
 		SetConcurrency(e.concurrency).
@@ -136,6 +164,70 @@ func (e *AnalyzeColumnsExec) buildResp(ranges []*ranger.Range) (distsql.SelectRe
 		return nil, err
 	}
 	return result, nil
+}
+
+func (e *AnalyzeColumnsExec) buildRangeSamplingPlan() (*analyzeRangeSamplingPlan, error) {
+	if e.analyzePB.GetTp() != tipb.AnalyzeType_TypeFullSampling || e.analyzePB.ColReq == nil {
+		return nil, nil
+	}
+	if e.analyzePB.ColReq.GetSampleSize() > 0 || e.baseCount <= 0 {
+		return nil, nil
+	}
+	sampleRate := e.analyzePB.ColReq.GetSampleRate()
+	if sampleRate <= 0 || sampleRate >= 1 {
+		return nil, nil
+	}
+
+	startKey := tablecodec.GenTableRecordPrefix(e.TableID.GetStatisticsID())
+	endKey := startKey.PrefixNext()
+	kvRanges, err := splitIntoMultiRanges(e.ctx.GetStore(), startKey, endKey)
+	if err != nil {
+		return nil, err
+	}
+
+	selectedRanges, selectedFraction := selectAnalyzeSampledRanges(kvRanges, sampleRate, e.TableID.GetStatisticsID())
+	if len(selectedRanges) == 0 || selectedFraction >= 1 {
+		return nil, nil
+	}
+	return &analyzeRangeSamplingPlan{
+		kvRanges:  selectedRanges,
+		fullCount: e.baseCount,
+	}, nil
+}
+
+func (e *AnalyzeColumnsExec) buildRangeSamplingAnalyzeReq(plan *analyzeRangeSamplingPlan) *tipb.AnalyzeReq {
+	analyzePB := util.ProtoV1Clone(e.analyzePB)
+	sampleRate := 1.0
+	analyzePB.ColReq.SampleRate = &sampleRate
+	analyzePB.ColReq.SampleSize = 0
+	return analyzePB
+}
+
+func selectAnalyzeSampledRanges(kvRanges []kv.KeyRange, sampleRate float64, statisticsID int64) ([]kv.KeyRange, float64) {
+	if len(kvRanges) <= 1 || sampleRate <= 0 {
+		return nil, 0
+	}
+	if sampleRate >= 1 {
+		return kvRanges, 1
+	}
+
+	selectedCount := int(math.Round(float64(len(kvRanges)) * sampleRate))
+	if selectedCount <= 0 {
+		selectedCount = 1
+	}
+	if selectedCount >= len(kvRanges) {
+		return kvRanges, 1
+	}
+
+	seed := int64(uint64(statisticsID)<<1) ^ int64(math.Float64bits(sampleRate)) ^ 0x5eedc0de
+	rng := rand.New(rand.NewSource(seed))
+	order := rng.Perm(len(kvRanges))
+	selected := make([]kv.KeyRange, 0, selectedCount)
+	for _, idx := range order[:selectedCount] {
+		selected = append(selected, kvRanges[idx])
+	}
+	sortRanges(selected, false)
+	return selected, float64(selectedCount) / float64(len(kvRanges))
 }
 
 func (e *AnalyzeColumnsExec) buildStats(ranges []*ranger.Range, needExtStats bool) (hists []*statistics.Histogram, cms []*statistics.CMSketch, topNs []*statistics.TopN, fms []*statistics.FMSketch, extStats *statistics.ExtendedStatsColl, err error) {
