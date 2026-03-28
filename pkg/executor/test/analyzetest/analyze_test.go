@@ -661,7 +661,7 @@ func TestAnalyzeSamplingUsesSampledRanges(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 4, regionCount)
 
-	tk.MustExec("analyze table t with 0.5 samplerate")
+	tk.MustExec("analyze table t with 0.04 samplerate")
 
 	rows := tk.MustQuery("select processed_rows from mysql.analyze_jobs order by id desc limit 1").Rows()
 	processedRows, err := strconv.Atoi(rows[0][0].(string))

@@ -34,6 +34,8 @@ import (
 	plannerutil "github.com/pingcap/tidb/pkg/planner/util"
 	"github.com/pingcap/tidb/pkg/statistics"
 	handleutil "github.com/pingcap/tidb/pkg/statistics/handle/util"
+	"github.com/pingcap/tidb/pkg/store/copr"
+	"github.com/pingcap/tidb/pkg/store/driver/backoff"
 	"github.com/pingcap/tidb/pkg/tablecodec"
 	"github.com/pingcap/tidb/pkg/types"
 	"github.com/pingcap/tidb/pkg/util"
@@ -41,6 +43,7 @@ import (
 	"github.com/pingcap/tidb/pkg/util/ranger"
 	"github.com/pingcap/tipb/go-tipb"
 	"github.com/tiancaiamao/gp"
+	"github.com/tikv/client-go/v2/tikv"
 )
 
 // AnalyzeColumnsExec represents Analyze columns push down executor.
@@ -66,9 +69,12 @@ type AnalyzeColumnsExec struct {
 }
 
 type analyzeRangeSamplingPlan struct {
-	kvRanges  []kv.KeyRange
-	fullCount int64
+	kvRanges        []kv.KeyRange
+	fullCount       int64
+	innerSampleRate float64
 }
+
+const minAnalyzeNDVRangeFraction = 0.05
 
 func analyzeColumnsPushDownEntry(gp *gp.Pool, e *AnalyzeColumnsExec) *statistics.AnalyzeResults {
 	if e.AnalyzeInfo.StatsVersion >= statistics.Version2 {
@@ -180,27 +186,43 @@ func (e *AnalyzeColumnsExec) buildRangeSamplingPlan() (*analyzeRangeSamplingPlan
 
 	startKey := tablecodec.GenTableRecordPrefix(e.TableID.GetStatisticsID())
 	endKey := startKey.PrefixNext()
-	kvRanges, err := splitIntoMultiRanges(e.ctx.GetStore(), startKey, endKey)
+	kvRanges, err := splitIntoAnalyzeRanges(e.ctx.GetStore(), startKey, endKey)
 	if err != nil {
 		return nil, err
 	}
 
-	selectedRanges, selectedFraction := selectAnalyzeSampledRanges(kvRanges, sampleRate, e.TableID.GetStatisticsID())
+	rangeFraction := chooseAnalyzeRangeFraction(sampleRate)
+	selectedRanges, selectedFraction := selectAnalyzeSampledRanges(kvRanges, rangeFraction, e.TableID.GetStatisticsID())
 	if len(selectedRanges) == 0 || selectedFraction >= 1 {
 		return nil, nil
 	}
+	innerSampleRate := sampleRate / selectedFraction
+	if innerSampleRate >= 1 {
+		return nil, nil
+	}
 	return &analyzeRangeSamplingPlan{
-		kvRanges:  selectedRanges,
-		fullCount: e.baseCount,
+		kvRanges:        selectedRanges,
+		fullCount:       e.baseCount,
+		innerSampleRate: innerSampleRate,
 	}, nil
 }
 
 func (e *AnalyzeColumnsExec) buildRangeSamplingAnalyzeReq(plan *analyzeRangeSamplingPlan) *tipb.AnalyzeReq {
 	analyzePB := util.ProtoV1Clone(e.analyzePB)
-	sampleRate := 1.0
+	sampleRate := plan.innerSampleRate
 	analyzePB.ColReq.SampleRate = &sampleRate
 	analyzePB.ColReq.SampleSize = 0
 	return analyzePB
+}
+
+func chooseAnalyzeRangeFraction(sampleRate float64) float64 {
+	if sampleRate <= 0 || sampleRate >= 1 {
+		return sampleRate
+	}
+	// Keep at least a small fixed outer range coverage for NDV/F1 while leaving
+	// the final row-sample rate controlled by the original sample rate through
+	// inner Bernoulli sampling.
+	return math.Max(sampleRate, minAnalyzeNDVRangeFraction)
 }
 
 func selectAnalyzeSampledRanges(kvRanges []kv.KeyRange, sampleRate float64, statisticsID int64) ([]kv.KeyRange, float64) {
@@ -211,7 +233,7 @@ func selectAnalyzeSampledRanges(kvRanges []kv.KeyRange, sampleRate float64, stat
 		return kvRanges, 1
 	}
 
-	selectedCount := int(math.Round(float64(len(kvRanges)) * sampleRate))
+	selectedCount := int(math.Ceil(float64(len(kvRanges)) * sampleRate))
 	if selectedCount <= 0 {
 		selectedCount = 1
 	}
@@ -228,6 +250,33 @@ func selectAnalyzeSampledRanges(kvRanges []kv.KeyRange, sampleRate float64, stat
 	}
 	sortRanges(selected, false)
 	return selected, float64(selectedCount) / float64(len(kvRanges))
+}
+
+func splitIntoAnalyzeRanges(store kv.Storage, startKey, endKey kv.Key) ([]kv.KeyRange, error) {
+	kvRange := kv.KeyRange{StartKey: startKey, EndKey: endKey}
+	s, ok := store.(tikv.Storage)
+	if !ok {
+		return []kv.KeyRange{kvRange}, nil
+	}
+
+	cache := copr.NewRegionCache(s.GetRegionCache())
+	bo := backoff.NewBackofferWithVars(context.Background(), 10000, nil)
+	locs, err := cache.SplitKeyRangesByBuckets(bo, copr.NewKeyRanges([]kv.KeyRange{kvRange}))
+	if err == nil {
+		ranges := make([]kv.KeyRange, 0, len(locs))
+		for _, loc := range locs {
+			if loc == nil || loc.Ranges == nil {
+				continue
+			}
+			for i := range loc.Ranges.Len() {
+				ranges = append(ranges, loc.Ranges.At(i))
+			}
+		}
+		if len(ranges) > 1 {
+			return ranges, nil
+		}
+	}
+	return splitIntoMultiRanges(store, startKey, endKey)
 }
 
 func (e *AnalyzeColumnsExec) buildStats(ranges []*ranger.Range, needExtStats bool) (hists []*statistics.Histogram, cms []*statistics.CMSketch, topNs []*statistics.TopN, fms []*statistics.FMSketch, extStats *statistics.ExtendedStatsColl, err error) {
