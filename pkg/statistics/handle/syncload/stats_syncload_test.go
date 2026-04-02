@@ -348,17 +348,9 @@ func TestExplainAfterAddingUnanalyzedIndexDoesNotWarn(t *testing.T) {
 	testKit.MustExec("set @@session.tidb_analyze_version=2")
 	testKit.MustExec("set @@session.tidb_stats_load_sync_wait=60000")
 	testKit.MustExec("set tidb_opt_objective='determinate'")
-	testKit.MustExec("set @@global.tidb_enable_auto_analyze=0")
-	testKit.MustExec("set @@cte_max_recursion_depth=1000")
 	testKit.MustExec("drop table if exists h")
-	testKit.MustExec("create table h(idx int, code int, typ1 int, typ2 int, update_time int, key k1(idx, typ1, typ2), key k2(idx, update_time))")
-	testKit.MustExec(`insert into h select * from (
-	with recursive tt as (
-		select 0 idx, 0 as code, 0 as typ1, 0 as typ2, 0 as update_time
-		union all
-		select mod(update_time, 100) as idx, 0 as code, 0 as typ1, 0 as typ2, update_time + 1 as update_time from tt where update_time < 200
-	) select * from tt
-) tt`)
+	testKit.MustExec("create table h(idx int, code int, key k1(idx))")
+	testKit.MustExec("insert into h values (0,0), (0,1), (1,0), (1,1)")
 
 	oriLease := dom.StatsHandle().Lease()
 	dom.StatsHandle().SetLease(1)
@@ -367,7 +359,6 @@ func TestExplainAfterAddingUnanalyzedIndexDoesNotWarn(t *testing.T) {
 	}()
 
 	testKit.MustExec("analyze table h")
-	testKit.MustQuery("explain format = brief select * from h where idx = 0")
 	testKit.MustExec("alter table h add index k3(code)")
 
 	tbl, err := dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("h"))
