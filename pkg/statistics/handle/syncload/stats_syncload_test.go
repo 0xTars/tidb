@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/pingcap/failpoint"
+	"github.com/pingcap/log"
 	"github.com/pingcap/tidb/pkg/config"
 	"github.com/pingcap/tidb/pkg/meta/model"
 	"github.com/pingcap/tidb/pkg/parser/ast"
@@ -31,6 +32,8 @@ import (
 	"github.com/pingcap/tidb/pkg/testkit/analyzehelper"
 	"github.com/pingcap/tidb/pkg/util/mathutil"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestConcurrentLoadHist(t *testing.T) {
@@ -326,6 +329,63 @@ func TestRetry(t *testing.T) {
 		task1.Retry = 0
 	}
 	require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/pkg/statistics/handle/syncload/mockReadStatsForOneFail"))
+}
+
+func TestExplainAfterAddingUnanalyzedIndexDoesNotWarn(t *testing.T) {
+	core, recorded := observer.New(zap.WarnLevel)
+	restore := log.ReplaceGlobals(
+		zap.New(core),
+		&log.ZapProperties{
+			Core:  core,
+			Level: zap.NewAtomicLevelAt(zap.InfoLevel),
+		},
+	)
+	defer restore()
+
+	store, dom := testkit.CreateMockStoreAndDomain(t)
+	testKit := testkit.NewTestKit(t, store)
+	testKit.MustExec("use test")
+	testKit.MustExec("set @@session.tidb_analyze_version=2")
+	testKit.MustExec("set @@session.tidb_stats_load_sync_wait=60000")
+	testKit.MustExec("set tidb_opt_objective='determinate'")
+	testKit.MustExec("set @@global.tidb_enable_auto_analyze=0")
+	testKit.MustExec("set @@cte_max_recursion_depth=1000")
+	testKit.MustExec("drop table if exists h")
+	testKit.MustExec("create table h(idx int, code int, typ1 int, typ2 int, update_time int, key k1(idx, typ1, typ2), key k2(idx, update_time))")
+	testKit.MustExec(`insert into h select * from (
+	with recursive tt as (
+		select 0 idx, 0 as code, 0 as typ1, 0 as typ2, 0 as update_time
+		union all
+		select mod(update_time, 100) as idx, 0 as code, 0 as typ1, 0 as typ2, update_time + 1 as update_time from tt where update_time < 200
+	) select * from tt
+) tt`)
+
+	oriLease := dom.StatsHandle().Lease()
+	dom.StatsHandle().SetLease(1)
+	defer func() {
+		dom.StatsHandle().SetLease(oriLease)
+	}()
+
+	testKit.MustExec("analyze table h")
+	testKit.MustQuery("explain format = brief select * from h where idx = 0")
+	testKit.MustExec("alter table h add index k3(code)")
+
+	tbl, err := dom.InfoSchema().TableByName(context.Background(), ast.NewCIStr("test"), ast.NewCIStr("h"))
+	require.NoError(t, err)
+	tableInfo := tbl.Meta()
+	idxInfo := tableInfo.FindIndexByName("k3")
+	require.NotNil(t, idxInfo)
+
+	statsTbl := dom.StatsHandle().GetPhysicalTableStats(tableInfo.ID, tableInfo)
+	require.False(t, statsTbl.ColAndIdxExistenceMap.HasAnalyzed(idxInfo.ID, true))
+	_, loadNeeded := statsTbl.IndexIsLoadNeeded(idxInfo.ID)
+	require.False(t, loadNeeded)
+
+	recorded.TakeAll()
+	testKit.MustQuery("explain format = brief select * from h force index(k3) where code = 0")
+
+	warnLogs := recorded.FilterMessage("Histogram not found, possibly due to DDL event is not handled, please consider analyze the table").All()
+	require.Len(t, warnLogs, 0)
 }
 
 func TestSendLoadRequestsWaitTooLong(t *testing.T) {
